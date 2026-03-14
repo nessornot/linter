@@ -17,11 +17,11 @@ import (
 // regexp for checks
 var (
 	// allow only eng letters, digits, spaсes, basic punctuation
-	allowedCharsRx = regexp.MustCompile(`^[a-zA-Z0-9\s\-_:\.,='"]+$`)
+	allowedCharsRx = regexp.MustCompile(`^[a-zA-Z0-9\s\-_:.,='"()\[\]{}/\\%!?]+$`)
 	specialEndRx = regexp.MustCompile(`[!?.]$`)
 
 	// key words
-	sensitiveWords =[]string{"password", "token", "api_key", "secret"}
+	sensitiveDataRx = regexp.MustCompile(`(password|token|api_key|secret)\s*[:=]`)
 )
 
 var Analyzer = &analysis.Analyzer{
@@ -83,20 +83,13 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			return
 		}
 
-		// get log body
 		if len(call.Args) == 0 {
 			return
 		}
-
+		
 		// trying to find string literal
-		basicLit, ok := call.Args[0].(*ast.BasicLit)
-		if !ok || basicLit.Kind != token.STRING {
-			return
-		}
-
-		// remove quotes from log body
-		msg, err := strconv.Unquote(basicLit.Value)
-		if err != nil || len(msg) == 0 {
+		msg, pos, ok := extractStrings(call.Args[0])
+		if !ok || len(msg) == 0 {
 			return
 		}
 
@@ -104,25 +97,24 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 		// 1. must start with lowercase letter
 		firstRune := []rune(msg)[0]
-		if unicode.IsUpper(firstRune) {
-			pass.Reportf(basicLit.Pos(), "log message must start with lowercase letter")
+		if unicode.IsLetter(firstRune) && unicode.IsUpper(firstRune) {
+			pass.Reportf(pos, "log message must start with lowercase letter")
 		}
 
-		// 2-3. must include only eng letters, nums and basic puntuation
+		// 2. must include only eng letters, nums and basic punctuation
 		if !allowedCharsRx.MatchString(msg) {
-			pass.Reportf(basicLit.Pos(), "log message must contain only english letters, numbers and basic punctuation (no emojis or special chars)")
+			pass.Reportf(pos, "log message must contain only english letters, numbers and basic punctuation (no emojis or special chars)")
 		}
-		if specialEndRx.MatchString(msg) || strings.HasSuffix(msg, "...") {
-			pass.Reportf(basicLit.Pos(), "log message should not end with punctuation marks like '!', '?' or '...'")
+
+		// 3. should not end with punctuation marks
+		if specialEndRx.MatchString(msg) {
+			pass.Reportf(pos, "log message should not end with punctuation marks")
 		}
 
 		// 4. log message must not contain sensitive data
 		lowerMsg := strings.ToLower(msg)
-		for _, word := range sensitiveWords {
-			if strings.Contains(lowerMsg, word) {
-				pass.Reportf(basicLit.Pos(), "log message contains potentially sensitive data: %s", word)
-				break
-			}
+		if match := sensitiveDataRx.FindStringSubmatch(lowerMsg); match != nil {
+			pass.Reportf(pos, "log message contains potentially sensitive data: %s", match[1])
 		}
 	})
 
@@ -132,8 +124,35 @@ func run(pass *analysis.Pass) (interface{}, error) {
 // checks if func is used for logging
 func isLogMethod(name string) bool {
 	switch name {
-	case "Debug", "Info", "Warn", "Error", "Fatal", "Panic":
+	case "Debug", "Info", "Warn", "Error", "Fatal", "Panic", "Log":
 		return true
 	}
 	return false
+}
+
+// get values from string literals
+func extractStrings(expr ast.Expr) (string, token.Pos, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind == token.STRING {
+			val, err := strconv.Unquote(e.Value)
+			if err == nil {
+				return val, e.Pos(), true
+			}
+		}
+	case *ast.BinaryExpr:
+		// if its concatenation
+		if e.Op == token.ADD {
+			lStr, lPos, lOk := extractStrings(e.X)
+			rStr, rPos, rOk := extractStrings(e.Y)
+
+			pos := lPos
+			if !lOk {
+				pos = rPos
+			}
+
+			return lStr + rStr, pos, lOk || rOk
+		}
+	}
+	return "", token.NoPos, false
 }
